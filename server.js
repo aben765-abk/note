@@ -1,30 +1,40 @@
 const express = require('express');
-const multer = require('multer');
-const pdfParse = require('pdf-parse');
 const cors = require('cors');
-const axios = require('axios'); // Ajouté pour télécharger les PDF par URL
+const axios = require('axios');
+const pdfParse = require('pdf-parse');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Augmenté pour les gros documents
+// Vérification de la clé API au démarrage pour éviter un crash silencieux plus tard
+if (!process.env.GEMINI_API_KEY) {
+    console.error("ERREUR FATALE : La variable GEMINI_API_KEY est manquante dans Railway.");
+}
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+app.use(cors());
+app.use(express.json({ limit: '30mb' }));
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "dummy_key");
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-09-2025" });
 
 /**
- * Fonction utilitaire pour extraire le texte d'un PDF à partir d'une URL
+ * Extraction PDF optimisée pour limiter l'usage de la RAM au strict minimum
  */
 async function extractTextFromPdfUrl(url) {
     try {
-        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        console.log(`[LOG] Téléchargement PDF : ${url}`);
+        const response = await axios.get(url, { 
+            responseType: 'arraybuffer',
+            timeout: 10000 
+        });
+        
+        // On n'utilise pas d'options de rendu personnalisées ici pour éviter les fuites mémoire
         const data = await pdfParse(response.data);
-        return data.text;
+        return data.text.substring(0, 15000); // On limite à 15k caractères par PDF pour la stabilité
     } catch (error) {
-        console.error(`Erreur extraction PDF (${url}):`, error);
-        return "[Erreur lors de la lecture de ce PDF]";
+        console.error(`[ERREUR] Impossible de lire le PDF : ${error.message}`);
+        return `[Contenu du document ${url} non accessible]`;
     }
 }
 
@@ -32,43 +42,41 @@ app.post('/api/chat', async (req, res) => {
     const { question, documents } = req.body;
 
     if (!question || !documents) {
-        return res.status(400).json({ error: "Données manquantes" });
+        return res.status(400).json({ error: "Requête malformée" });
     }
 
     try {
-        // Traitement asynchrone de tous les documents (WP, URL, PDF)
-        const processedDocs = await Promise.all(documents.map(async (doc) => {
+        let contextParts = [];
+
+        // Traitement synchrone/séquentiel pour Railway (évite les pics de CPU)
+        for (const doc of documents) {
             let content = doc.content || "";
-            
-            // Si c'est un PDF et qu'on a une URL mais pas encore de contenu extrait
-            if (doc.type === 'PDF' && doc.url && !doc.content) {
+            if (doc.type === 'PDF' && doc.url && content.length < 50) {
                 content = await extractTextFromPdfUrl(doc.url);
             }
-            
-            return `[Source: ${doc.title} (${doc.type})]\n${content}`;
-        }));
+            contextParts.push(`SOURCE: ${doc.title}\nCONTENU: ${content}`);
+        }
 
-        const context = processedDocs.join('\n\n---\n\n');
-        
-        const systemPrompt = `Tu es un assistant expert. Réponds de manière précise en utilisant UNIQUEMENT le contexte suivant. Si la réponse n'est pas dans les documents, dis-le.
-        
-        CONTEXTE :
-        ${context}`;
+        const systemPrompt = `Tu es un assistant de recherche. Réponds en utilisant le contexte suivant. 
+        Cite les sources. Si tu ne sais pas, dis-le.\n\nCONTEXTE :\n${contextParts.join('\n\n')}`;
 
         const result = await model.generateContent([
             { text: systemPrompt },
-            { text: `Question de l'utilisateur : ${question}` }
+            { text: question }
         ]);
 
         const response = await result.response;
         res.json({ answer: response.text() });
 
     } catch (error) {
-        console.error("Erreur API Gemini:", error);
-        res.status(500).json({ error: "Erreur lors du traitement de la requête" });
+        console.error("[ERREUR API]", error);
+        res.status(500).json({ error: "Erreur serveur", details: error.message });
     }
 });
 
-app.listen(port, () => {
-    console.log(`Serveur prêt sur le port ${port}`);
+// Route de santé pour que Railway sache que le serveur est vivant
+app.get('/health', (req, res) => res.send('OK'));
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`[SUCCESS] Serveur Notebook AI démarré sur le port ${port}`);
 });
