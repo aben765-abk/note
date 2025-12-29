@@ -21,7 +21,6 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-09-202
 
 /**
  * Extrait le texte d'un PDF depuis une URL.
- * Désactive le rendu graphique pour éviter les crashs sur Railway.
  */
 async function extractTextFromPdfUrl(url) {
     try {
@@ -50,63 +49,98 @@ async function extractTextFromPdfUrl(url) {
 }
 
 /**
- * Extrait le contenu textuel d'une page Web (HTML).
- * Nettoie les balises scripts, styles et HTML pour ne garder que le texte utile.
+ * Nettoie le HTML pour extraire le texte brut
  */
-async function extractTextFromWebUrl(url) {
-    try {
-        console.log(`[LOG] Extraction de la page Web : ${url}`);
-        // Ajout d'un User-Agent pour éviter d'être bloqué par certains sites
-        const response = await axios.get(url, { 
-            timeout: 10000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-        });
-        
-        const html = response.data;
-        if (typeof html !== 'string') return "[Format de page non supporté]";
-
-        const cleanText = html
-            .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "") // Supprime les scripts
-            .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")   // Supprime les styles
-            .replace(/<[^>]+>/g, ' ')                             // Supprime les balises HTML
-            .replace(/\s+/g, ' ')                                  // Nettoie les espaces multiples
-            .trim();
-
-        return cleanText.substring(0, 15000); 
-    } catch (error) {
-        console.error(`[ERREUR URL] Sur ${url} : ${error.message}`);
-        return `[Impossible de lire le contenu de ce lien : ${error.message}]`;
-    }
+function cleanHtml(html) {
+    return html
+        .replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, "")
+        .replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gim, "")
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 }
 
 /**
- * Point d'entrée principal pour le chat et l'analyse
+ * Extrait le contenu textuel d'une page Web et explore les liens internes (Crawling léger)
+ * @param {string} baseUrl - L'URL de départ
+ * @param {number} maxPages - Nombre maximum de pages à explorer (Mis à 6)
+ */
+async function extractTextFromWebUrl(baseUrl, maxPages = 6) {
+    const visited = new Set();
+    const toVisit = [baseUrl];
+    let aggregatedText = "";
+    const domain = new URL(baseUrl).hostname;
+
+    console.log(`[LOG] Début de l'exploration multi-pages (limite: ${maxPages}) pour : ${baseUrl}`);
+
+    while (toVisit.length > 0 && visited.size < maxPages) {
+        const url = toVisit.shift();
+        if (visited.has(url)) continue;
+
+        try {
+            visited.add(url);
+            const response = await axios.get(url, { 
+                timeout: 8000,
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+            });
+
+            const html = response.data;
+            if (typeof html !== 'string') continue;
+
+            // Ajouter le texte de la page actuelle
+            aggregatedText += `\n--- CONTENU DE LA PAGE : ${url} ---\n`;
+            aggregatedText += cleanHtml(html).substring(0, 8000);
+
+            // Trouver de nouveaux liens sur la même page (liens internes uniquement)
+            if (visited.size < maxPages) {
+                const linkRegex = /href="([^"]+)"/g;
+                let match;
+                while ((match = linkRegex.exec(html)) !== null) {
+                    try {
+                        let link = match[1];
+                        if (link.startsWith('/')) link = new URL(link, baseUrl).href;
+                        
+                        const linkUrl = new URL(link);
+                        // On vérifie que le lien est sur le même domaine et n'a pas encore été visité
+                        if (linkUrl.hostname === domain && !visited.has(link) && !toVisit.includes(link)) {
+                            toVisit.push(link);
+                        }
+                    } catch (e) { /* Lien invalide ignoré */ }
+                }
+            }
+        } catch (error) {
+            console.error(`[ERREUR EXPLORATION] ${url} : ${error.message}`);
+        }
+    }
+
+    // Augmentation de la limite à 40 000 caractères pour supporter les 6 pages
+    return aggregatedText.substring(0, 40000); 
+}
+
+/**
+ * Point d'entrée principal pour le chat
  */
 app.post('/api/chat', async (req, res) => {
     const { question, documents } = req.body;
 
     if (!question || !documents || !Array.isArray(documents)) {
-        return res.status(400).json({ error: "Requête invalide ou documents manquants." });
+        return res.status(400).json({ error: "Requête invalide." });
     }
 
     try {
-        console.log(`[API] Requête reçue. Analyse de ${documents.length} sources.`);
+        console.log(`[API] Analyse de ${documents.length} sources.`);
         let contextParts = [];
 
-        // Traitement séquentiel pour la stabilité de la RAM
         for (const doc of documents) {
             let content = doc.content || "";
             
-            // Cas 1 : Le document est un PDF et nécessite une extraction
             if (doc.type === 'PDF' && doc.url && content.length < 50) {
                 content = await extractTextFromPdfUrl(doc.url);
             } 
-            // Cas 2 : Le document est une URL externe
             else if (doc.type === 'URL' && (doc.title.startsWith('http') || doc.url)) {
                 const targetUrl = doc.url || doc.title;
-                content = await extractTextFromWebUrl(targetUrl);
+                // Exploration de 6 pages maximum par URL configurée ici
+                content = await extractTextFromWebUrl(targetUrl, 6);
             }
             
             contextParts.push(`SOURCE: ${doc.title}\nCONTENU: ${content}`);
@@ -115,9 +149,9 @@ app.post('/api/chat', async (req, res) => {
         const fullContext = contextParts.join('\n\n---\n\n');
 
         const systemPrompt = `Tu es un assistant de recherche expert. 
-        Réponds à la question de l'utilisateur en te basant sur le contexte fourni.
-        Cite systématiquement le titre de la source.
-        Si l'information n'est pas présente, dis que tu ne sais pas.
+        Réponds à la question en te basant sur le contexte fourni. 
+        Le contexte contient plusieurs pages explorées pour chaque site web (jusqu'à 6 pages par source).
+        Cite précisément les sources. Si l'information est manquante, dis-le.
 
         CONTEXTE :
         ${fullContext}`;
@@ -136,9 +170,8 @@ app.post('/api/chat', async (req, res) => {
     }
 });
 
-// Route de santé pour Railway
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 app.listen(port, '0.0.0.0', () => {
-    console.log(`[READY] Serveur Notebook AI actif sur le port ${port}`);
+    console.log(`[READY] Serveur Notebook AI actif avec exploration étendue (6 pages).`);
 });
